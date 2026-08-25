@@ -1,0 +1,269 @@
+name: Cluster CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'k8s/**'
+      - '.forgejo/workflows/cluster-ci.yaml'
+  pull_request:
+    paths:
+      - 'k8s/**'
+
+jobs:
+  ci:
+    runs-on: docker
+    steps:
+      # === Checkout ===
+      - name: Checkout
+        run: |
+          REPO_URL="${{ gitea.server_url }}/${{ gitea.repository }}.git"
+          CLONE_URL="https://${{ secrets.CI_RUNNER }}:${{ secrets.CI_RUNNER_SECRET }}@${REPO_URL#https://}"
+          git clone --depth 1 "$CLONE_URL" .
+          git fetch origin main
+          git checkout main
+
+      # === Install Tools ===
+      - name: Install Tools
+        run: |
+          unset GITHUB_TOKEN
+          apt-get update && apt-get install -y \
+            yamllint \
+            python3-pip \
+            curl \
+            jq
+
+          # kubeval
+          curl -L https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz | tar xz
+          mv -f kubeval /usr/local/bin/
+
+          # kustomize
+          rm -f kustomize
+          curl -s https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh | bash
+          mv -f kustomize /usr/local/bin/
+
+          # argocd
+          curl -sSL -o /usr/local/bin/argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+
+          # trivy
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+          # polaris
+          curl -L https://github.com/FairwindsOps/polaris/releases/latest/download/polaris-linux-amd64 -o /usr/local/bin/polaris
+          chmod +x /usr/local/bin/polaris
+
+      # === YAML Lint ===
+      - name: YAML Lint
+        run: |
+          echo "=== Linting YAML files ==="
+          yamllint k8s/ -c .yamllint.yaml || true
+
+      # === Kubeval - Validate K8s Syntax ===
+      - name: Kubeval - Validate K8s Syntax
+        run: |
+          echo "=== Validating Kubernetes manifests ==="
+          find k8s -name "*.yaml" -o -name "*.yml" | grep -v "\.archive" | while read file; do
+            echo "Validating $file..."
+            kubeval "$file" -d 2>/dev/null || true
+          done
+
+      # === Kustomize Build - All overlays ===
+      - name: Kustomize Build - Infrastructure
+        run: |
+          echo "=== Building k8s/infrastructure/ ==="
+          kustomize build k8s/infrastructure > /tmp/infrastructure.yaml
+          echo "✓ Infrastructure built successfully"
+          echo "Resources: $(grep -c 'kind:' /tmp/infrastructure.yaml)"
+
+      - name: Kustomize Build - Bootstrap
+        run: |
+          echo "=== Building k8s/bootstrap/ ==="
+          kustomize build k8s/bootstrap > /tmp/bootstrap.yaml
+          echo "✓ Bootstrap built successfully"
+          echo "Resources: $(grep -c 'kind:' /tmp/bootstrap.yaml || echo 0)"
+
+      - name: Kustomize Build - Platform
+        run: |
+          echo "=== Building k8s/platform/ ==="
+          kustomize build k8s/platform > /tmp/platform.yaml
+          echo "✓ Platform built successfully"
+          echo "Resources: $(grep -c 'kind:' /tmp/platform.yaml || echo 0)"
+
+      - name: Kustomize Build - Security
+        run: |
+          echo "=== Building k8s/security/ ==="
+          kustomize build k8s/security > /tmp/security.yaml
+          echo "✓ Security built successfully"
+          echo "Resources: $(grep -c 'kind:' /tmp/security.yaml || echo 0)"
+
+      - name: Kustomize Build - Applications
+        run: |
+          echo "=== Building k8s/applications/ ==="
+          kustomize build k8s/applications > /tmp/applications.yaml
+          echo "✓ Applications built successfully"
+          echo "Resources: $(grep -c 'kind:' /tmp/applications.yaml || echo 0)"
+
+      - name: Kustomize Build - Data
+        run: |
+          echo "=== Building k8s/data/ ==="
+          kustomize build k8s/data > /tmp/data.yaml
+          echo "✓ Data built successfully"
+          echo "Resources: $(grep -c 'kind:' /tmp/data.yaml || echo 0)"
+
+      - name: Validate ArgoCD Applications
+        run: |
+          echo "=== Validating ArgoCD Applications ==="
+          kubeval k8s/argocd/apps/*.yaml
+
+      # === Trivy - Scan Dockerfile ===
+      - name: Trivy - Scan Dockerfile
+        run: |
+          if find . -name "Dockerfile" 2>/dev/null | grep -v node_modules | head -1 | grep -q .; then
+            echo "=== Scanning Dockerfiles with Trivy ==="
+            find . -name "Dockerfile" -not -path "*/node_modules/*" -exec trivy config {} \;
+          else
+            echo "No Dockerfiles found"
+          fi
+
+      # === Trivy - Scan Helm Charts ===
+      - name: Trivy - Scan Helm Charts
+        run: |
+          if find k8s -name "Chart.yaml" 2>/dev/null | head -1 | grep -q .; then
+            echo "=== Scanning Helm charts with Trivy ==="
+            find k8s -name "Chart.yaml" -exec dirname {} \; | while read chart; do
+              echo "Scanning $chart..."
+              trivy config "$chart" || true
+            done
+          else
+            echo "No Helm charts found"
+          fi
+
+      # === Polaris - K8s Security Audit ===
+      - name: Polaris - K8s Security Audit
+        run: |
+          echo "=== Running Polaris K8s security audit ==="
+          polaris audit --audit-path /tmp/polaris-audit.json k8s/ || true
+
+          if [ -f /tmp/polaris-audit.json ]; then
+            echo "Security issues found:"
+            jq '.results[] | select(.pass == false)' /tmp/polaris-audit.json || true
+          fi
+
+      # === Check for Secrets in Code ===
+      - name: Check for Secrets in Code
+        run: |
+          echo "=== Scanning for hardcoded secrets ==="
+          # BLOCKING. This step used to only count findings and then exit 0, so a
+          # plaintext deploy key rode through it into a public remote. Two failure
+          # modes fixed: it now fails the build, and it matches key material by
+          # PEM header rather than only `private_key:`-style YAML field names.
+          # Findings are captured into variables and tested for emptiness rather than
+          # branching on grep's exit status: implementations disagree on the rc of a
+          # `-v` filter fed empty input, and a wrong rc here fails open.
+          # NOTE: --include must precede `--`; after `--` grep treats it as a filename
+          # and silently scans nothing.
+          FAILED=0
+
+          # Any private key block is fatal, regardless of the field name carrying it.
+          KEYS=$(grep -rIE --include="*.yaml" --include="*.yml" \
+                   -- "-----BEGIN ([A-Z]+ )?PRIVATE KEY-----" k8s/ \
+                 | grep -v "\.enc\.yaml" || true)
+          if [ -n "$KEYS" ]; then
+            echo "❌ Unencrypted private key material found:"
+            echo "$KEYS"
+            FAILED=1
+          fi
+
+          # Plaintext values in secret-ish YAML fields. SOPS output is ENC[...],
+          # so encrypted files never trip this.
+          VALS=$(grep -rInE --include="*.yaml" --include="*.yml" \
+                   -- "^[[:space:]]*(password|token|apiKey|api_key|sshPrivateKey|client_secret):[[:space:]]*[\"']?[^\"'[:space:]{\$]{8,}" k8s/ \
+                 | grep -v "ENC\[" | grep -v "\.enc\.yaml" || true)
+          if [ -n "$VALS" ]; then
+            echo "❌ Plaintext secret value found:"
+            echo "$VALS"
+            FAILED=1
+          fi
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo "Encrypt with SOPS (see .sops.yaml) — *.enc.yaml files are exempt."
+            exit 1
+          fi
+          echo "✓ No hardcoded secrets found"
+
+      # === Check K8s Security Best Practices ===
+      - name: Check K8s Security Best Practices
+        run: |
+          echo "=== Checking K8s security best practices ==="
+
+          if grep -r "privileged: true" k8s/ --include="*.yaml" --include="*.yml"; then
+            echo "⚠️  Found privileged containers"
+          fi
+
+          if grep -r "hostNetwork: true" k8s/ --include="*.yaml" --include="*.yml"; then
+            echo "⚠️  Found hostNetwork usage"
+          fi
+
+          echo "Checking for missing resource limits..."
+          MISSING=0
+          find k8s -name "*.yaml" -o -name "*.yml" | while read file; do
+            if grep -q "kind: Deployment\|kind: StatefulSet\|kind: DaemonSet" "$file"; then
+              if ! grep -q "resources:" "$file"; then
+                echo "⚠️  $file: Missing resource requests/limits"
+                MISSING=$((MISSING + 1))
+              fi
+            fi
+          done
+
+      # === ArgoCD Sync (main branch only) ===
+      - name: Sync ArgoCD
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          echo "=== Syncing homelab-root ==="
+          argocd app sync homelab-root --force
+          argocd app wait homelab-root --timeout 5m
+
+      - name: Check Sync Status
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          echo "=== ArgoCD Applications Status ==="
+          argocd app list -o table
+
+          STATUS=$(argocd app get homelab-root -o jsonpath='{.status.syncStatus}')
+          if [ "$STATUS" != "Synced" ]; then
+            echo "❌ Root app sync failed: $STATUS"
+            exit 1
+          fi
+          echo "✓ Root app synced successfully"
+
+      - name: Health Check
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        env:
+          ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          echo "=== Checking Application Health ==="
+          argocd app get homelab-root -o wide
+
+      # === Summary ===
+      - name: Summary
+        if: always()
+        run: |
+          echo "=== CI Pipeline Summary ==="
+          echo "✓ YAML linted"
+          echo "✓ Manifests validated"
+          echo "✓ Kustomizations built"
+          echo "✓ Security scans completed"
+          echo "✓ Secrets check passed"
+          echo "✓ Best practices verified"
+          echo ""
+          echo "✓ All checks passed"

@@ -1,0 +1,68 @@
+# Environment files — real values must never be committed
+.env
+.env.terraform.sh
+
+# Private CA key and generated TLS certs — ca.key must never enter the cluster or git.
+# Only ca.crt is safe to share, but we exclude the whole dir to avoid accidents.
+forge/pki/
+
+# Talos machine configs — contain WireGuard private keys, bootstrap tokens, PKI
+cluster-config/controlplane.yaml
+cluster-config/worker*.yaml
+cluster-config/talos-worker*.yaml
+cluster-config/cp-*.yaml
+cluster-config/talos-cp-*.yaml
+cluster-config/secrets.yaml
+cluster-config/talosconfig
+talos-forge-trust.yaml
+# Kubeconfig — contains admin client certificate + private key
+cluster-config/kubeconfig
+
+*.html
+LOG.md
+project_context.md
+.claude/*
+
+ca.crt
+ca.key
+ca.srl
+
+forgejo.crt
+forgejo.key
+forgejo.csr
+
+# Compiled test binary — Go produces a native binary named after the directory.
+# Source is k8s/storage/test/main.go; the binary has no place in version control.
+k8s/storage/test/test
+
+*.key
+*.conf
+
+# CLAUDE.md is now version-controlled (was previously excluded as a
+# private-notes file; contains no secrets - just architecture, IPs
+# [private RFC1918 space], and operational lessons, same bar as README.md).
+
+# Terraform state and cache (local files, remote state in MinIO)
+.terraform/
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform.tfvars.local
+skills-lock.json
+secrets-plaintext.yaml
+
+# Saved plan files — binary, environment-specific, may embed resource attributes
+terraform/tfplan
+terraform/tfplan-*
+
+.DS_Store
+CLAUDE.md
+docs/
+
+bootstrap-argocd.log
+
+# Any plaintext (non-SOPS) secret manifest. Encrypted ones are *.enc.yaml and
+# ARE committed — see .sops.yaml. A missing newline once merged two patterns on
+# one line here, which is how a plaintext deploy key reached a public remote.
+k8s/**/*-secret.yaml
+!k8s/**/*.enc.yaml
